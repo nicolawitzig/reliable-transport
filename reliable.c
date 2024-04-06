@@ -32,10 +32,12 @@ struct reliable_state {
     int timer;			/* How often rel_timer called in milliseconds */
     int timeout;			/* Retransmission timeout in milliseconds */
 
-    // array to keep track which seq_no the buffer has already seen
-    char* inserted_packets;
-    // array to keep track of the conditions to close the session
-    char* ready_to_close;
+
+    // flags to keep track of the conditions to close the session
+    int recv_eof;
+    int read_eof;
+    int all_packs_acked;
+    int all_output_written;
 };
 
 rel_t *rel_list;
@@ -78,9 +80,12 @@ const struct config_common *cc)
     r->window = cc->window;
     r->timer = cc->timer;
     r->timeout = cc->timeout;
-
-    r->inserted_packets = (char*)calloc(4, sizeof(char));
-    r->ready_to_close = (char*)calloc(4, sizeof(char));
+    
+    //init flags to 0
+    r->all_output_written = 0;
+    r->all_packs_acked = 0;
+    r->read_eof = 0;
+    r->recv_eof = 0;
 
     fprintf(stderr, "reliable protocol session created \n");
 
@@ -102,18 +107,17 @@ rel_destroy (rel_t *r)
     buffer_clear(r->rec_buffer);
     free(r->rec_buffer);
     // ...
-    free(r->ready_to_close);
-    free(r->inserted_packets);
+    
 
     fprintf(stderr, "reliable protocol session destoyed \n");
 
 }
-void check_rel_destory(rel_t *r){
-    if((r->ready_to_close[0])==(r->ready_to_close[1])==(r->ready_to_close[2])==(r->ready_to_close[3])==1){
-                rel_destroy(r);
-                fprintf(stderr, "Session was destroyed");
-            }
-    return;
+int check_rel_destory(rel_t *r){
+    if(r->all_output_written && r->all_packs_acked && r->read_eof && r->recv_eof){
+        rel_destroy(r);
+        return 1;
+    }
+    return 0;
 }
 
 long buffer_next_seqno(buffer_t *buffer){
@@ -164,13 +168,11 @@ void rel_recvpkt(rel_t *r, packet_t *pkt, size_t n) {
         // Process ACK, remove acknowledged packets from send buffer
         fprintf(stderr, "Received an ack \n");
         buffer_remove(r->send_buffer, ntohl(pkt->ackno));
-        fprintf(stderr, "removed packets up to achno from buffer \n");
+        fprintf(stderr, "removed packets up to ackno from buffer \n");
         if(r->send_buffer->head == NULL){
             fprintf(stderr, "send buffer is now empty \n");
             // send buffer is now empty
-            r->ready_to_close[2] = 1;
-            check_rel_destory(r);
-            
+            r->all_packs_acked = 1;
             return;
         }
         fprintf(stderr, "send buffer is not empty \n");
@@ -180,8 +182,7 @@ void rel_recvpkt(rel_t *r, packet_t *pkt, size_t n) {
     // EOF
     if(n == 12){
         fprintf(stderr, "all received EOF");
-        r->ready_to_close[0] = 1;
-        check_rel_destory(r);
+        r->recv_eof = 1;
     }
 
     // Non empty data packet
@@ -197,25 +198,21 @@ void rel_recvpkt(rel_t *r, packet_t *pkt, size_t n) {
 
 
 void rel_read(rel_t *r) {
-
     // Check if the send window is full
     if (buffer_size(r->send_buffer) >= r->window) {
         fprintf(stderr, "send window is full\n");
         return; // Window is full, cannot send more data yet
     }
-    
 
     // Read data and prepare data packet
     char data[500];
     int data_len = conn_input(r->c, data, sizeof(data));
     if (data_len <= 0) {
-        r->ready_to_close[1] = 1;
+        r->read_eof = 1;
         fprintf(stderr, "no data read or EOF/error");
-        check_rel_destory(r);
         return; // No data read or EOF/error
     }
     
-
     // Create and send packet
     packet_t pkt;
     memset(&pkt, 0, sizeof(pkt));
@@ -228,7 +225,6 @@ void rel_read(rel_t *r) {
         // Successfully sent, insert into send buffer for potential retransmission
         buffer_insert(r->send_buffer, &pkt, (long)time(NULL));
     }
-
     return;
 }
 
@@ -241,7 +237,6 @@ void rel_output(rel_t *r) {
             // Log or handle error: Invalid packet size
             break;
         }
-
         // Calculate data length excluding header
         size_t data_len = ntohs(node->packet.len) - 12;
         if (conn_bufspace(r->c) < data_len) {
@@ -253,22 +248,26 @@ void rel_output(rel_t *r) {
         if (data_len > 0) {
             conn_output(r->c, node->packet.data, data_len);
         }
-
         // Move to next packet after successful write
         buffer_remove_first(r->rec_buffer);
         node = buffer_get_first(r->rec_buffer);
     }
     fprintf(stderr, "all data output written");
-    r->ready_to_close[3] = 1;
-    check_rel_destory(r);
+    r->all_output_written = 1;
+    
 
 }
 
 
 
 void rel_timer() {
+
     for (rel_t *current = rel_list; current != NULL; current = current->next) {
         // Check and retransmit any packets that have timed out
+        if(check_rel_destory(current)){
+            continue;
+        }
+
         long current_time = (long)time(NULL);
         for (buffer_node_t *node = buffer_get_first(current->send_buffer);
              node != NULL; node = node->next) {
