@@ -31,8 +31,11 @@ struct reliable_state {
     int window;			/* # of unacknowledged packets in flight */
     int timer;			/* How often rel_timer called in milliseconds */
     int timeout;			/* Retransmission timeout in milliseconds */
-    uint32_t expected_seqno;
-    uint32_t output_seqno;
+    
+    //sequence numbers to keep track off
+    uint32_t next_seqno_inord; //next in order sequence number of received packages
+    uint32_t next_output_seqno; //next sequence number to output
+    uint32_t next_input_seqno; //next sequence number for a package created from input
 
     // flags to keep track of the conditions to close the session
     int recv_eof;
@@ -81,8 +84,10 @@ const struct config_common *cc)
     r->window = cc->window;
     r->timer = cc->timer;
     r->timeout = cc->timeout;
-    r->expected_seqno = 1;
-    r->output_seqno = 1;
+    r->next_seqno_inord = 1;
+    r->next_output_seqno = 1;
+    r->next_input_seqno = 1;
+
     //init flags to 0
     r->all_output_written = 0;
     r->all_packs_acked = 0;
@@ -122,7 +127,7 @@ int check_rel_destory(rel_t *r){
     return 0;
 }
 
-void update_next_seqno(rel_t * r){
+void update_next_seqno_inord(rel_t * r){
     // function to find the next in order sequence number
 
     buffer_node_t *current = r->rec_buffer->head;
@@ -135,13 +140,13 @@ void update_next_seqno(rel_t * r){
     }
     fprintf(stderr, "next sequence number calculated \n");
 
-    r->expected_seqno = ntohl(current->packet.seqno) + 1;
+    r->next_seqno_inord = ntohl(current->packet.seqno) + 1;
 }
 
 void send_ack(rel_t *r){
     packet_t ack_pkt;
     memset(&ack_pkt, 0, sizeof(ack_pkt));
-    ack_pkt.ackno = r->expected_seqno; // Next expected seqno
+    ack_pkt.ackno = r->next_seqno_inord; // Next expected seqno
     ack_pkt.len = htons(8); // ACK packet size
     ack_pkt.cksum = cksum(&ack_pkt, 8);
 
@@ -170,7 +175,7 @@ void rel_recvpkt(rel_t *r, packet_t *pkt, size_t n) {
         // Process ACK, remove acknowledged packets from send buffer
         fprintf(stderr, "Received an ack \n");
         buffer_remove(r->send_buffer, ntohl(pkt->ackno));
-        fprintf(stderr, "removed packets up to \%d from buffer \n", pkt->ackno);
+        fprintf(stderr, "removed packets up to \%d from buffer \n", ntohl(pkt->ackno));
         if(r->send_buffer->head == NULL){
             fprintf(stderr, "send buffer is now empty \n");
             // send buffer is now empty
@@ -193,7 +198,7 @@ void rel_recvpkt(rel_t *r, packet_t *pkt, size_t n) {
     if (!buffer_contains(r->rec_buffer, ntohl(pkt->seqno))) {
         // insert packet into buffer
         buffer_insert(r->rec_buffer, pkt, (long)time(NULL));
-        update_next_seqno(r);
+        update_next_seqno_inord(r);
         fprintf(stderr, "Inserted packet into buffer\n");
     }
     send_ack(r);
@@ -220,13 +225,15 @@ void rel_read(rel_t *r) {
     // Create and send packet
     packet_t pkt;
     memset(&pkt, 0, sizeof(pkt));
-    pkt.seqno = htonl(expected_seqno); // Next sequence number
+    pkt.seqno = htonl(r->next_input_seqno); // Next sequence number
+    
     pkt.len = htons(12 + data_len);
     memcpy(pkt.data, data, data_len);
     pkt.cksum = cksum(&pkt, 12 + data_len);
 
     if (conn_sendpkt(r->c, &pkt, 12 + data_len) > 0) {
         // Successfully sent, insert into send buffer for potential retransmission
+        r->next_input_seqno++;
         buffer_insert(r->send_buffer, &pkt, (long)time(NULL));
         r->all_packs_acked = 0;
     }
@@ -235,6 +242,7 @@ void rel_read(rel_t *r) {
 
 
 void rel_output(rel_t *r) {
+    fprintf(stderr, "rel_output called");
     buffer_node_t *node = buffer_get_first(r->rec_buffer);
     while (node != NULL) {
         // Ensure packet length is at least the size of the header
@@ -242,7 +250,7 @@ void rel_output(rel_t *r) {
             // Log or handle error: Invalid packet size
             break;
         }
-        if(ntohl(node->packet.seqno != r->output_seqno)){
+        if(ntohl(node->packet.seqno != r->next_output_seqno)){
             break;
         }
         // Calculate data length excluding header
@@ -253,13 +261,13 @@ void rel_output(rel_t *r) {
         }
         conn_output(r->c, node->packet.data, data_len);
         // update next seqno to output
-        r->output_seqno++;
+        r->next_output_seqno++;
         // Move to next packet after successful write
         buffer_remove_first(r->rec_buffer);
         node = buffer_get_first(r->rec_buffer);
     }
     if(node == NULL){
-        printf(stderr, "all data output written");
+        fprintf(stderr, "all data output written");
         r->all_output_written = 1;
     }
 
@@ -271,7 +279,7 @@ void rel_timer() {
 
     for (rel_t *current = rel_list; current != NULL; current = current->next) {
         // Check and retransmit any packets that have timed out
-        fprintf(stderr, "Received EOF %d,Read EOF %d, all packets acked %d, all outpu written %d \n", current->recv_eof, current->read_eof, current->all_packs_acked, current->all_output_written);
+        //fprintf(stderr, "Received EOF %d,Read EOF %d, all packets acked %d, all outpu written %d \n", current->recv_eof, current->read_eof, current->all_packs_acked, current->all_output_written);
         if(check_rel_destory(current)){
             continue;
         }
