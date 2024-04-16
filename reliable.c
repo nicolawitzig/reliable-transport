@@ -146,9 +146,9 @@ void update_next_seqno_inord(rel_t * r){
 void send_ack(rel_t *r){
     packet_t ack_pkt;
     memset(&ack_pkt, 0, sizeof(ack_pkt));
-    ack_pkt.ackno = r->next_seqno_inord; // Next expected seqno
+    ack_pkt.ackno = htonl(r->next_seqno_inord); // Next expected seqno
     ack_pkt.len = htons(8); // ACK packet size
-    ack_pkt.cksum = cksum(&ack_pkt, 8);
+    ack_pkt.cksum = htonl(cksum(&ack_pkt, 8));
 
     conn_sendpkt(r->c, &ack_pkt, 8);
     fprintf(stderr, "Sent an ack \n");
@@ -162,7 +162,7 @@ void rel_recvpkt(rel_t *r, packet_t *pkt, size_t n) {
         return; // Packet is corrupted or incomplete
     }
 
-    // Verify checksum
+    // checksum
     uint16_t pkt_cksum = pkt->cksum;
     pkt->cksum = 0;
     if (cksum(pkt, n) != pkt_cksum) {
@@ -170,7 +170,7 @@ void rel_recvpkt(rel_t *r, packet_t *pkt, size_t n) {
         return; // Checksum does not match, packet is corrupted
     }
 
-    // Handle ACK packets
+    // ACK packets
     if (n == 8) {
         // Process ACK, remove acknowledged packets from send buffer
         fprintf(stderr, "Received an ack \n");
@@ -245,12 +245,13 @@ void rel_output(rel_t *r) {
     fprintf(stderr, "rel_output called");
     buffer_node_t *node = buffer_get_first(r->rec_buffer);
     while (node != NULL) {
-        // Ensure packet length is at least the size of the header
+        // ensure packet length is at least the size of the header
         if (ntohs(node->packet.len) < 12) {
             // Log or handle error: Invalid packet size
             break;
         }
-        if(ntohl(node->packet.seqno != r->next_output_seqno)){
+        //ensure the sequence number is correct
+        if(ntohl(node->packet.seqno) != r->next_output_seqno){
             break;
         }
         // Calculate data length excluding header
@@ -278,12 +279,16 @@ void rel_output(rel_t *r) {
 void rel_timer() {
 
     for (rel_t *current = rel_list; current != NULL; current = current->next) {
-        // Check and retransmit any packets that have timed out
+        
         //fprintf(stderr, "Received EOF %d,Read EOF %d, all packets acked %d, all outpu written %d \n", current->recv_eof, current->read_eof, current->all_packs_acked, current->all_output_written);
         if(check_rel_destory(current)){
             continue;
         }
 
+        //call output
+        rel_output(current);
+
+        // Check and retransmit any packets that have timed out
         long current_time = (long)time(NULL);
         for (buffer_node_t *node = buffer_get_first(current->send_buffer);
              node != NULL; node = node->next) {
