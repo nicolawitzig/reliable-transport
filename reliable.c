@@ -242,7 +242,7 @@ void rel_read(rel_t *r) {
 
 
 void rel_output(rel_t *r) {
-    fprintf(stderr, "rel_output called");
+    // fprintf(stderr, "rel_output called\n");
     buffer_node_t *node = buffer_get_first(r->rec_buffer);
     while (node != NULL) {
         // ensure packet length is at least the size of the header
@@ -268,7 +268,7 @@ void rel_output(rel_t *r) {
         node = buffer_get_first(r->rec_buffer);
     }
     if(node == NULL){
-        fprintf(stderr, "all data output written");
+        //fprintf(stderr, "all data output written\n");
         r->all_output_written = 1;
     }
 
