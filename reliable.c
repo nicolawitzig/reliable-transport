@@ -36,7 +36,7 @@ struct reliable_state {
     uint32_t next_seqno_inord; //next in order sequence number of received packages
     uint32_t next_output_seqno; //next sequence number to output
     uint32_t next_input_seqno; //next sequence number for a package created from input
-
+    uint32_t highest_ack_seqno; // highest seqno acknowledged so far
     // flags to keep track of the conditions to close the session
     int recv_eof;
     int read_eof;
@@ -87,6 +87,7 @@ const struct config_common *cc)
     r->next_seqno_inord = 1;
     r->next_output_seqno = 1;
     r->next_input_seqno = 1;
+    r->highest_ack_seqno = 0;
 
     //init flags to 0
     r->all_output_written = 0;
@@ -148,7 +149,8 @@ void send_ack(rel_t *r){
     memset(&ack_pkt, 0, sizeof(ack_pkt));
     ack_pkt.ackno = htonl(r->next_seqno_inord); // Next expected seqno
     ack_pkt.len = htons(8); // ACK packet size
-    ack_pkt.cksum = htonl(cksum(&ack_pkt, 8));
+    ack_pkt.cksum = 0;
+    ack_pkt.cksum = cksum(&ack_pkt, 8);
 
     conn_sendpkt(r->c, &ack_pkt, 8);
     fprintf(stderr, "Sent an ack \n");
@@ -175,6 +177,8 @@ void rel_recvpkt(rel_t *r, packet_t *pkt, size_t n) {
         // Process ACK, remove acknowledged packets from send buffer
         fprintf(stderr, "Received an ack \n");
         buffer_remove(r->send_buffer, ntohl(pkt->ackno));
+        r->highest_ack_seqno =  ntohl(pkt->ackno);
+
         fprintf(stderr, "removed packets up to \%d from buffer \n", ntohl(pkt->ackno));
         if(r->send_buffer->head == NULL){
             fprintf(stderr, "send buffer is now empty \n");
@@ -208,7 +212,7 @@ void rel_recvpkt(rel_t *r, packet_t *pkt, size_t n) {
 
 void rel_read(rel_t *r) {
     // Check if the send window is full
-    if (buffer_size(r->send_buffer) >= r->window) {
+    if (r->next_input_seqno - r->highest_ack_seqno > r->window) {
         fprintf(stderr, "send window is full\n");
         return; // Window is full, cannot send more data yet
     }
@@ -226,7 +230,7 @@ void rel_read(rel_t *r) {
     packet_t pkt;
     memset(&pkt, 0, sizeof(pkt));
     pkt.seqno = htonl(r->next_input_seqno); // Next sequence number
-    
+    pkt.cksum = 0;
     pkt.len = htons(12 + data_len);
     memcpy(pkt.data, data, data_len);
     pkt.cksum = cksum(&pkt, 12 + data_len);
@@ -280,7 +284,7 @@ void rel_timer() {
 
     for (rel_t *current = rel_list; current != NULL; current = current->next) {
         
-        //fprintf(stderr, "Received EOF %d,Read EOF %d, all packets acked %d, all outpu written %d \n", current->recv_eof, current->read_eof, current->all_packs_acked, current->all_output_written);
+        fprintf(stderr, "Received EOF %d,Read EOF %d, all packets acked %d, all output written %d \n", current->recv_eof, current->read_eof, current->all_packs_acked, current->all_output_written);
         if(check_rel_destory(current)){
             continue;
         }
