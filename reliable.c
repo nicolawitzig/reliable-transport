@@ -33,10 +33,11 @@ struct reliable_state {
     int timeout;			/* Retransmission timeout in milliseconds */
     
     //sequence numbers to keep track off
-    uint32_t next_seqno_inord; //next in order sequence number of received packages
+    uint32_t recv_ackno; // which ackno has been received
+    uint32_t send_ackno; // which seqno is the next ackno
+
     uint32_t next_output_seqno; //next sequence number to output
     uint32_t next_input_seqno; //next sequence number for a package created from input
-    uint32_t highest_ack_seqno; // highest seqno acknowledged so far
     // flags to keep track of the conditions to close the session
     int recv_eof;
     int read_eof;
@@ -84,14 +85,16 @@ const struct config_common *cc)
     r->window = cc->window;
     r->timer = cc->timer;
     r->timeout = cc->timeout;
-    r->next_seqno_inord = 1;
+    
+    r->recv_ackno = 1;
+    r->send_ackno = 1;
+
     r->next_output_seqno = 1;
     r->next_input_seqno = 1;
-    r->highest_ack_seqno = 0;
 
     //init flags to 0
-    r->all_output_written = 0;
-    r->all_packs_acked = 0;
+    r->all_output_written = 1;
+    r->all_packs_acked = 1;
     r->read_eof = 0;
     r->recv_eof = 0;
 
@@ -128,7 +131,7 @@ int check_rel_destory(rel_t *r){
     return 0;
 }
 
-void update_next_seqno_inord(rel_t * r){
+void update_send_ackno(rel_t * r){
     // function to find the next in order sequence number
 
     buffer_node_t *current = r->rec_buffer->head;
@@ -139,26 +142,26 @@ void update_next_seqno_inord(rel_t * r){
     while(current->next != NULL && ntohl(current->packet.seqno) == ntohl(current->next->packet.seqno)-1){
         current = current->next;
     }
-    fprintf(stderr, "next sequence number calculated \n");
-
-    r->next_seqno_inord = ntohl(current->packet.seqno) + 1;
+    r->send_ackno = ntohl(current->packet.seqno) + 1;
+    fprintf(stderr, "next ackno to send calculated: %d \n", r->send_ackno);
 }
 
 void send_ack(rel_t *r){
     packet_t ack_pkt;
     memset(&ack_pkt, 0, sizeof(ack_pkt));
-    ack_pkt.ackno = htonl(r->next_seqno_inord); // Next expected seqno
+    ack_pkt.ackno = htonl(r->send_ackno); 
     ack_pkt.len = htons(8); // ACK packet size
     ack_pkt.cksum = 0;
     ack_pkt.cksum = cksum(&ack_pkt, 8);
 
     conn_sendpkt(r->c, &ack_pkt, 8);
-    fprintf(stderr, "Sent an ack \n");
+    fprintf(stderr, "Sent an ack with ackno %d \n", ntohl(ack_pkt.ackno));
 }
 
 // n is the expected length of pkt
 void rel_recvpkt(rel_t *r, packet_t *pkt, size_t n) {
-    fprintf(stderr, "recv packet called \n");
+    
+   fprintf(stderr, "recv packet called \n");
     if (n < 8) { // Minimum packet size check (ACK packet size)
         fprintf(stderr, "Packet is corrupted or incomplete \n");
         return; // Packet is corrupted or incomplete
@@ -175,18 +178,24 @@ void rel_recvpkt(rel_t *r, packet_t *pkt, size_t n) {
     // ACK packets
     if (n == 8) {
         // Process ACK, remove acknowledged packets from send buffer
-        fprintf(stderr, "Received an ack \n");
-        buffer_remove(r->send_buffer, ntohl(pkt->ackno));
-        r->highest_ack_seqno =  ntohl(pkt->ackno);
+        fprintf(stderr, "Received an ack with ackno %d\n", ntohl(pkt->ackno));
+        fprintf(stderr, "Ackno received so far %d\n", r->recv_ackno);
+        
+        //Check if the sliding window has moved
+        if(ntohl(pkt->ackno)>r->recv_ackno){
+            fprintf(stderr, "Sliding window has changed \n");
+            r->recv_ackno =  ntohl(pkt->ackno);
+            rel_read(r);
+        }
+        buffer_remove(r->send_buffer, r->recv_ackno);
 
-        fprintf(stderr, "removed packets up to \%d from buffer \n", ntohl(pkt->ackno));
+        fprintf(stderr, "removed packets up to %d from buffer \n", r->recv_ackno);
         if(r->send_buffer->head == NULL){
             fprintf(stderr, "send buffer is now empty \n");
             // send buffer is now empty
             r->all_packs_acked = 1;
             return;
         }
-        fprintf(stderr, "send buffer is not empty \n");
         return;
     }
 
@@ -201,9 +210,17 @@ void rel_recvpkt(rel_t *r, packet_t *pkt, size_t n) {
     // buffer does not contain the data
     if (!buffer_contains(r->rec_buffer, ntohl(pkt->seqno))) {
         // insert packet into buffer
-        buffer_insert(r->rec_buffer, pkt, (long)time(NULL));
-        update_next_seqno_inord(r);
+        struct timeval now;
+        gettimeofday(&now, NULL);
+        long now_ms = now.tv_sec * 1000 + now.tv_usec / 1000;
+
+        buffer_insert(r->rec_buffer, pkt, now_ms);
+        r->all_output_written = 0;
+        update_send_ackno(r);
         fprintf(stderr, "Inserted packet into buffer\n");
+        
+    }else{
+        fprintf(stderr, "received a packet that was already in buffer\n");
     }
     send_ack(r);
     
@@ -212,8 +229,8 @@ void rel_recvpkt(rel_t *r, packet_t *pkt, size_t n) {
 
 void rel_read(rel_t *r) {
     // Check if the send window is full
-    if (r->next_input_seqno - r->highest_ack_seqno > r->window) {
-        fprintf(stderr, "send window is full\n");
+    if ((r->next_input_seqno - (r->recv_ackno-1)) > r->window) {
+        fprintf(stderr, "Max window is: %d, seqno of next packet is: %d, received in order ack up to packet: %d \n", r->window, r->next_input_seqno, (r->recv_ackno-1));
         return; // Window is full, cannot send more data yet
     }
 
@@ -222,13 +239,13 @@ void rel_read(rel_t *r) {
     int data_len = conn_input(r->c, data, sizeof(data));
     if (data_len <= 0) {
         r->read_eof = 1;
-        fprintf(stderr, "no data read or EOF/error");
+        fprintf(stderr, "no data read or EOF/error\n");
         return; // No data read or EOF/error
     }
     
     // Create and send packet
     packet_t pkt;
-    memset(&pkt, 0, sizeof(pkt));
+    void * pkt_pointer = memset(&pkt, 0, sizeof(pkt));
     pkt.seqno = htonl(r->next_input_seqno); // Next sequence number
     pkt.cksum = 0;
     pkt.len = htons(12 + data_len);
@@ -238,8 +255,14 @@ void rel_read(rel_t *r) {
     if (conn_sendpkt(r->c, &pkt, 12 + data_len) > 0) {
         // Successfully sent, insert into send buffer for potential retransmission
         r->next_input_seqno++;
-        buffer_insert(r->send_buffer, &pkt, (long)time(NULL));
+        struct timeval now;
+        gettimeofday(&now, NULL);
+        long now_ms = now.tv_sec * 1000 + now.tv_usec / 1000;
+
+        buffer_insert(r->send_buffer, &pkt, now_ms);
         r->all_packs_acked = 0;
+    }else{
+        free(pkt_pointer);
     }
     return;
 }
@@ -249,11 +272,7 @@ void rel_output(rel_t *r) {
     // fprintf(stderr, "rel_output called\n");
     buffer_node_t *node = buffer_get_first(r->rec_buffer);
     while (node != NULL) {
-        // ensure packet length is at least the size of the header
-        if (ntohs(node->packet.len) < 12) {
-            // Log or handle error: Invalid packet size
-            break;
-        }
+        
         //ensure the sequence number is correct
         if(ntohl(node->packet.seqno) != r->next_output_seqno){
             break;
@@ -284,7 +303,7 @@ void rel_timer() {
 
     for (rel_t *current = rel_list; current != NULL; current = current->next) {
         
-        fprintf(stderr, "Received EOF %d,Read EOF %d, all packets acked %d, all output written %d \n", current->recv_eof, current->read_eof, current->all_packs_acked, current->all_output_written);
+        //fprintf(stderr, "Received EOF %d,Read EOF %d, all packets acked %d, all output written %d \n", current->recv_eof, current->read_eof, current->all_packs_acked, current->all_output_written);
         if(check_rel_destory(current)){
             continue;
         }
@@ -293,18 +312,23 @@ void rel_timer() {
         rel_output(current);
 
         // Check and retransmit any packets that have timed out
-        long current_time = (long)time(NULL);
+        
+        struct timeval now;
+        gettimeofday(&now, NULL);
+        long now_ms = now.tv_sec * 1000 + now.tv_usec / 1000;
+        
         for (buffer_node_t *node = buffer_get_first(current->send_buffer);
              node != NULL; node = node->next) {
-            if (current_time - node->last_retransmit > current->timeout) {
+            if (now_ms - node->last_retransmit > current->timeout) {
                 // Retransmit packet
                 node->packet.cksum = 0; // Reset checksum
                 node->packet.cksum = cksum(&node->packet, ntohs(node->packet.len));
                 conn_sendpkt(current->c, &node->packet, ntohs(node->packet.len));
-                node->last_retransmit = current_time;
-                fprintf(stderr,"packet has been resent");
+                node->last_retransmit = now_ms;
+                fprintf(stderr,"packet has been resent \n");
             }
-        }
+             }
+
     }
 }
 
