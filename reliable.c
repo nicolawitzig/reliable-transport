@@ -162,8 +162,9 @@ void send_ack(rel_t *r){
 void rel_recvpkt(rel_t *r, packet_t *pkt, size_t n) {
     
    fprintf(stderr, "recv packet called \n");
-    if (n < 8) { // Minimum packet size check (ACK packet size)
-        fprintf(stderr, "Packet is corrupted or incomplete \n");
+    
+    if (n < 8 || n > 512) { 
+        fprintf(stderr, "invalid packet length \n");
         return; // Packet is corrupted or incomplete
     }
 
@@ -175,9 +176,9 @@ void rel_recvpkt(rel_t *r, packet_t *pkt, size_t n) {
         return; // Checksum does not match, packet is corrupted
     }
 
-    // ACK packets
+    // ack packets
     if (n == 8) {
-        // Process ACK, remove acknowledged packets from send buffer
+        
         fprintf(stderr, "Received an ack with ackno %d\n", ntohl(pkt->ackno));
         fprintf(stderr, "Ackno received so far %d\n", r->recv_ackno);
         
@@ -186,27 +187,28 @@ void rel_recvpkt(rel_t *r, packet_t *pkt, size_t n) {
             fprintf(stderr, "Sliding window has changed \n");
             r->recv_ackno =  ntohl(pkt->ackno);
             rel_read(r);
+            buffer_remove(r->send_buffer, r->recv_ackno);
+            fprintf(stderr, "removed packets up to %d from buffer \n", r->recv_ackno);
         }
-        buffer_remove(r->send_buffer, r->recv_ackno);
 
-        fprintf(stderr, "removed packets up to %d from buffer \n", r->recv_ackno);
+        // check if send buffer is now empty
         if(r->send_buffer->head == NULL){
             fprintf(stderr, "send buffer is now empty \n");
-            // send buffer is now empty
             r->all_packs_acked = 1;
             return;
         }
         return;
     }
 
-    // EOF
+    // received an eof
     if(n == 12){
         fprintf(stderr, "received EOF\n");
         r->recv_eof = 1;
+        //not sure if we need to ack eofs
+        send_ack(r);
         return;
     }
 
-    // Non empty data packet
     // buffer does not contain the data
     if (!buffer_contains(r->rec_buffer, ntohl(pkt->seqno))) {
         // insert packet into buffer
@@ -312,7 +314,6 @@ void rel_timer() {
         rel_output(current);
 
         // Check and retransmit any packets that have timed out
-        
         struct timeval now;
         gettimeofday(&now, NULL);
         long now_ms = now.tv_sec * 1000 + now.tv_usec / 1000;
