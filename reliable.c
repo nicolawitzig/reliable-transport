@@ -166,7 +166,6 @@ void rel_recvpkt(rel_t *r, packet_t *pkt, size_t n) {
         return;
     }
     
-
     if (n < 8 || n > 512) { 
         fprintf(stderr, "invalid packet length \n");
         return; // Packet is corrupted or incomplete
@@ -187,7 +186,7 @@ void rel_recvpkt(rel_t *r, packet_t *pkt, size_t n) {
         fprintf(stderr, "Ackno received so far %d\n", r->recv_ackno);
         
         //Check if the sliding window has moved
-        if(ntohl(pkt->ackno)>r->recv_ackno){
+        if(ntohl(pkt->ackno) > r->recv_ackno){
             fprintf(stderr, "Sliding window has changed \n");
             r->recv_ackno =  ntohl(pkt->ackno);
             rel_read(r);
@@ -235,41 +234,45 @@ void rel_recvpkt(rel_t *r, packet_t *pkt, size_t n) {
 
 void rel_read(rel_t *r) {
     // Check if the send window is full
-    if ((r->next_input_seqno - (r->recv_ackno-1)) > r->window) {
-        fprintf(stderr, "Max window is: %d, seqno of next packet is: %d, received in order ack up to packet: %d \n", r->window, r->next_input_seqno, (r->recv_ackno-1));
-        return; // Window is full, cannot send more data yet
-    }
+    int data_len;
+    do{
+        if ((r->next_input_seqno - r->recv_ackno) >= r->window) {
+            fprintf(stderr, "Max window is: %d, seqno of next packet is: %d, received in order ack up to packet: %d \n", r->window, r->next_input_seqno, (r->recv_ackno-1));
+            return; // Window is full, cannot send more data yet
+        }
 
-    // Read data and prepare data packet
-    char data[500];
-    int data_len = conn_input(r->c, data, sizeof(data));
-    if (data_len <= 0) {
-        r->read_eof = 1;
-        fprintf(stderr, "no data read or EOF/error\n");
-        return; // No data read or EOF/error
-    }
+    // read data packet
+        char data[500];
+        data_len = conn_input(r->c, data, sizeof(data));
+        if (data_len <= 0) {
+            r->read_eof = 1;
+            fprintf(stderr, "no data read or EOF/error\n");
+            return; // No data read or EOF/error
+        }
     
-    // Create and send packet
-    packet_t pkt;
-    void * pkt_pointer = memset(&pkt, 0, sizeof(pkt));
-    pkt.seqno = htonl(r->next_input_seqno); // Next sequence number
-    pkt.cksum = 0;
-    pkt.len = htons(12 + data_len);
-    memcpy(pkt.data, data, data_len);
-    pkt.cksum = cksum(&pkt, 12 + data_len);
+    // send data packet
+        packet_t pkt;
+        void * pkt_pointer = memset(&pkt, 0, sizeof(pkt));
+        pkt.seqno = htonl(r->next_input_seqno); // Next sequence number
+        pkt.cksum = 0;
+        pkt.len = htons(12 + data_len);
+        memcpy(pkt.data, data, data_len);
+        pkt.cksum = cksum(&pkt, 12 + data_len);
 
-    if (conn_sendpkt(r->c, &pkt, 12 + data_len) > 0) {
-        // Successfully sent, insert into send buffer for potential retransmission
-        r->next_input_seqno++;
-        struct timeval now;
-        gettimeofday(&now, NULL);
-        long now_ms = now.tv_sec * 1000 + now.tv_usec / 1000;
+        if (conn_sendpkt(r->c, &pkt, 12 + data_len) > 0) {
+            // Successfully sent, insert into send buffer for potential retransmission
+            r->next_input_seqno++;
+            struct timeval now;
+            gettimeofday(&now, NULL);
+            long now_ms = now.tv_sec * 1000 + now.tv_usec / 1000;
+            buffer_insert(r->send_buffer, &pkt, now_ms);
+            r->all_packs_acked = 0;
+        }else{
+            free(pkt_pointer);
+        }
+        
+    }while(data_len > 0);
 
-        buffer_insert(r->send_buffer, &pkt, now_ms);
-        r->all_packs_acked = 0;
-    }else{
-        free(pkt_pointer);
-    }
     return;
 }
 
@@ -278,12 +281,11 @@ void rel_output(rel_t *r) {
     // fprintf(stderr, "rel_output called\n");
     buffer_node_t *node = buffer_get_first(r->rec_buffer);
     while (node != NULL) {
-        
         //ensure the sequence number is correct
         if(ntohl(node->packet.seqno) != r->next_output_seqno){
             break;
         }
-        // Calculate data length excluding header
+        // data length excluding header
         size_t data_len = ntohs(node->packet.len) - 12;
         if (conn_bufspace(r->c) < data_len) {
             // Not enough space in output buffer, exit to avoid partial writes
