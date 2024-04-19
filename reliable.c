@@ -161,8 +161,12 @@ void send_ack(rel_t *r){
 // n is the expected length of pkt
 void rel_recvpkt(rel_t *r, packet_t *pkt, size_t n) {
     
-   fprintf(stderr, "recv packet called \n");
+    if(n != ntohl(pkt->len)){
+        fprintf(stderr, "packet len corrupted \n");
+        return;
+    }
     
+
     if (n < 8 || n > 512) { 
         fprintf(stderr, "invalid packet length \n");
         return; // Packet is corrupted or incomplete
